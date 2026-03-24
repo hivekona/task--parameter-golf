@@ -80,8 +80,7 @@ class Hyperparameters:
     qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "0")))
     bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 2048))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
-    trigram_enabled = bool(int(os.environ.get("TRIGRAM", "0")))  # TrigramHash (off by default, risky)
-    xsa_last_n = int(os.environ.get("XSA_LAST_N", 11))  # XSA on ALL layers (our novel contribution)
+    xsa_last_n = int(os.environ.get("XSA_LAST_N", 4))
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))
     ln_scale = bool(int(os.environ.get("LN_SCALE", "1")))
     dtg_enabled = bool(int(os.environ.get("DTG_ENABLED", "0")))
@@ -90,10 +89,15 @@ class Hyperparameters:
     ve_dim = int(os.environ.get("VE_DIM", 128))
     ve_layers = os.environ.get("VE_LAYERS", "9,10")
     gated_attention = bool(int(os.environ.get("GATED_ATTENTION", "0")))
-    value_residual = bool(int(os.environ.get("VALUE_RESIDUAL", "0")))  # VRL with sigmoid gates (off by default, risky)
-    # GPTQ calibration
-    gptq_calib_batches = int(os.environ.get("GPTQ_CALIB_BATCHES", 256))
-    gptq_block_size = int(os.environ.get("GPTQ_BLOCK_SIZE", 128))
+    value_residual = bool(int(os.environ.get("VALUE_RESIDUAL", "0")))
+    ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "0")))
+    ttt_lr = float(os.environ.get("TTT_LR", 0.002))
+    ttt_epochs = int(os.environ.get("TTT_EPOCHS", 3))
+    ttt_chunk_tokens = int(os.environ.get("TTT_CHUNK_TOKENS", 32768))
+    ttt_freeze_blocks = int(os.environ.get("TTT_FREEZE_BLOCKS", 2))
+    ttt_momentum = float(os.environ.get("TTT_MOMENTUM", 0.9))
+    ttt_batch_seqs = int(os.environ.get("TTT_BATCH_SEQS", 32))
+    ttt_grad_clip = float(os.environ.get("TTT_GRAD_CLIP", 1.0))
 
 # --- Batched Newton-Schulz orthogonalization ---
 
@@ -629,7 +633,7 @@ class CausalSelfAttention(nn.Module):
             nn.init.constant_(self.attn_gate.bias, 4.0)
         self.value_residual = value_residual
         if value_residual:
-            self.vrl_alpha = nn.Parameter(torch.zeros(1, dtype=torch.float32))  # sigmoid gate (PR #569 style)
+            self.vr_lambda = nn.Parameter(torch.tensor([0.5, 0.5], dtype=torch.float32))
     def _xsa_efficient(self, y: Tensor, v: Tensor) -> Tensor:
         """Efficient XSA: subtract self-value projection via GQA-aware reshape (no repeat_interleave).
         y: [B, T, H, D], v: [B, T, Hkv, D]. H must be divisible by Hkv."""
@@ -650,8 +654,8 @@ class CausalSelfAttention(nn.Module):
         v = v.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
         raw_v = v if self.value_residual else None
         if self.value_residual and v0 is not None:
-            alpha = torch.sigmoid(self.vrl_alpha.to(dtype=v.dtype))
-            v = v + alpha * v0  # sigmoid-gated residual (PR #569 style)
+            lam = self.vr_lambda.to(dtype=v.dtype)
+            v = lam[0] * v0 + lam[1] * v
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
@@ -678,10 +682,9 @@ class SmearGate(nn.Module):
         return (1 - g) * x + g * x_prev
 
 class BigramHashEmbedding(nn.Module):
-    def __init__(self, bigram_vocab_size: int, bigram_dim: int, model_dim: int, trigram: bool = False):
+    def __init__(self, bigram_vocab_size: int, bigram_dim: int, model_dim: int):
         super().__init__()
         self.bigram_vocab_size = bigram_vocab_size
-        self._trigram = trigram
         self.embed = nn.Embedding(bigram_vocab_size, bigram_dim)
         nn.init.zeros_(self.embed.weight)
         self.proj = CastedLinear(bigram_dim, model_dim, bias=False) if bigram_dim != model_dim else None
@@ -695,18 +698,8 @@ class BigramHashEmbedding(nn.Module):
         out[..., 0] = mod
         out[..., 1:] = torch.bitwise_xor(36313 * t[..., 1:], 27191 * t[..., :-1]) % mod
         return out.long()
-    def trigram_hash(self, tokens: Tensor) -> Tensor:
-        """Hash (t-2, t-1, t) trigrams into same embedding table. Zero extra params."""
-        t = tokens.to(torch.int32)
-        mod = self.bigram_vocab_size - 1
-        out = torch.empty_like(t)
-        out[..., :2] = mod
-        out[..., 2:] = (36313 * t[..., 2:] ^ 27191 * t[..., 1:-1] ^ 51497 * t[..., :-2]) % mod
-        return out.long()
     def forward(self, token_ids: Tensor) -> Tensor:
         h = self.embed(self.bigram_hash(token_ids))
-        if self._trigram:
-            h = h + self.embed(self.trigram_hash(token_ids))
         if self.proj is not None:
             h = self.proj(h)
         return h * self.scale.to(dtype=h.dtype)
@@ -817,7 +810,7 @@ class GPT(nn.Module):
         self.mtp_num_heads = mtp_num_heads
         self.mtp_loss_weight = mtp_loss_weight
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
-        self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim, trigram=bool(int(os.environ.get("TRIGRAM", "0")))) if bigram_vocab_size > 0 else None
+        self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
         self.smear = SmearGate(model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
@@ -1078,6 +1071,164 @@ def eval_val_sliding(
     return val_loss, bits_per_token * tokens_per_byte
 
 
+def eval_val_sliding_ttt(
+    args: Hyperparameters, base_model: nn.Module, rank: int, world_size: int,
+    device: torch.device, val_tokens: Tensor, base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor, is_boundary_token_lut: Tensor,
+    stride: int, batch_seqs: int = 32, log0=print,
+) -> tuple[float, float]:
+    """Legal score-first TTT (PR #461 recipe): score each chunk with sliding windows,
+    then train on it. Every token scored BEFORE any update that could use it."""
+    seq_len = args.train_seq_len
+    total_tokens = val_tokens.numel() - 1
+    ttt_chunk = args.ttt_chunk_tokens
+
+    # Pre-compute all window starts
+    window_starts = [ws for ws in range(0, total_tokens, stride)
+                     if min(ws + seq_len, total_tokens) - ws >= stride or ws == 0]
+
+    # Assign each window to a chunk based on the first token it scores
+    num_chunks = (total_tokens + ttt_chunk - 1) // ttt_chunk
+    chunk_windows: list[list[int]] = [[] for _ in range(num_chunks)]
+    for ws in window_starts:
+        end = min(ws + seq_len, total_tokens)
+        wlen = end - ws
+        s = 0 if ws == 0 else max(wlen - stride, 0)
+        scored_start = ws + s
+        ci = min(scored_start // ttt_chunk, num_chunks - 1)
+        chunk_windows[ci].append(ws)
+
+    log0(f"ttt_sliding:start chunks={num_chunks} chunk_tokens={ttt_chunk} "
+         f"total_windows={len(window_starts)} stride={stride} "
+         f"ttt_lr={args.ttt_lr} ttt_epochs={args.ttt_epochs} "
+         f"freeze_blocks={args.ttt_freeze_blocks}")
+
+    loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    token_count = torch.zeros((), device=device, dtype=torch.float64)
+    byte_count = torch.zeros((), device=device, dtype=torch.float64)
+
+    # Freeze first N blocks
+    frozen_block_ids = set(range(min(args.ttt_freeze_blocks, len(base_model.blocks))))
+    ttt_params = []
+    for name, p in base_model.named_parameters():
+        freeze = False
+        for bi in frozen_block_ids:
+            if f"blocks.{bi}." in name:
+                freeze = True
+                break
+        if freeze:
+            p.requires_grad_(False)
+        else:
+            p.requires_grad_(True)
+            ttt_params.append(p)
+
+    log0(f"ttt_sliding:params unfrozen={sum(p.numel() for p in ttt_params)} "
+         f"frozen={sum(p.numel() for p in base_model.parameters() if not p.requires_grad)}")
+
+    optimizer = torch.optim.SGD(ttt_params, lr=args.ttt_lr, momentum=args.ttt_momentum)
+    t0 = time.perf_counter()
+
+    for ci in range(num_chunks):
+        windows = chunk_windows[ci]
+        if not windows:
+            continue
+        chunk_start = ci * ttt_chunk
+        chunk_end = min((ci + 1) * ttt_chunk, total_tokens)
+
+        # --- Phase 1: SCORE this chunk's windows (inference_mode) ---
+        my_s = (len(windows) * rank) // world_size
+        my_e = (len(windows) * (rank + 1)) // world_size
+        my_windows = windows[my_s:my_e]
+
+        base_model.eval()
+        with torch.inference_mode():
+            for bi in range(0, len(my_windows), batch_seqs):
+                batch_ws = my_windows[bi:bi + batch_seqs]
+                bsz = len(batch_ws)
+                x_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
+                y_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
+                wlens: list[int] = []
+                for i, ws in enumerate(batch_ws):
+                    end = min(ws + seq_len, total_tokens)
+                    wlen = end - ws
+                    wlens.append(wlen)
+                    chunk_tok = val_tokens[ws:end + 1].to(dtype=torch.int64, device=device)
+                    x_batch[i, :wlen] = chunk_tok[:-1]
+                    y_batch[i, :wlen] = chunk_tok[1:]
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    logits = base_model.forward_logits(x_batch)
+                nll = F.cross_entropy(
+                    logits.reshape(-1, logits.size(-1)).float(),
+                    y_batch.reshape(-1), reduction="none",
+                ).reshape(bsz, seq_len)
+                for i, ws in enumerate(batch_ws):
+                    wlen = wlens[i]
+                    s = 0 if ws == 0 else max(wlen - stride, 0)
+                    scored_nll = nll[i, s:wlen].to(torch.float64)
+                    loss_sum += scored_nll.sum()
+                    token_count += float(wlen - s)
+                    tgt, prev = y_batch[i, s:wlen], x_batch[i, s:wlen]
+                    tb = base_bytes_lut[tgt].to(torch.float64)
+                    tb += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).to(torch.float64)
+                    byte_count += tb.sum()
+
+        # --- Phase 2: TRAIN on this chunk (already scored = legal) ---
+        is_last_chunk = (ci == num_chunks - 1)
+        if not is_last_chunk and args.ttt_epochs > 0:
+            base_model.train()
+            chunk_seqs = (chunk_end - chunk_start) // seq_len
+            if chunk_seqs > 0:
+                cos_lr = args.ttt_lr * 0.5 * (1.0 + math.cos(math.pi * ci / max(num_chunks - 1, 1)))
+                for pg in optimizer.param_groups:
+                    pg['lr'] = cos_lr
+                my_seq_s = (chunk_seqs * rank) // world_size
+                my_seq_e = (chunk_seqs * (rank + 1)) // world_size
+                my_chunk_seqs = my_seq_e - my_seq_s
+                for _ep in range(args.ttt_epochs):
+                    for bs in range(0, my_chunk_seqs, args.ttt_batch_seqs):
+                        be = min(bs + args.ttt_batch_seqs, my_chunk_seqs)
+                        actual_bs = my_seq_s + bs
+                        start_tok = chunk_start + actual_bs * seq_len
+                        end_tok = chunk_start + (my_seq_s + be) * seq_len + 1
+                        if end_tok > val_tokens.numel():
+                            continue
+                        local = val_tokens[start_tok:end_tok].to(device=device, dtype=torch.int64)
+                        x = local[:-1].reshape(-1, seq_len)
+                        y = local[1:].reshape(-1, seq_len)
+                        optimizer.zero_grad(set_to_none=True)
+                        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                            loss = base_model(x, y)
+                        loss.backward()
+                        if world_size > 1:
+                            for p in ttt_params:
+                                if p.grad is not None:
+                                    dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
+                        torch.nn.utils.clip_grad_norm_(ttt_params, args.ttt_grad_clip)
+                        optimizer.step()
+
+        if rank == 0 and (ci % 10 == 0 or ci == num_chunks - 1):
+            elapsed = time.perf_counter() - t0
+            rl = loss_sum.item() / max(token_count.item(), 1)
+            rbpb = rl / math.log(2.0) * (token_count.item() / max(byte_count.item(), 1)) if token_count.item() > 0 else 0.0
+            log0(f"  ttt_chunk [{ci+1}/{num_chunks}] bpb={rbpb:.6f} time={elapsed:.1f}s")
+
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
+        dist.all_reduce(byte_count, op=dist.ReduceOp.SUM)
+
+    val_loss = (loss_sum / token_count).item()
+    val_bpb = val_loss / math.log(2.0) * (token_count.item() / byte_count.item())
+
+    for p in base_model.parameters():
+        p.requires_grad_(True)
+    base_model.eval()
+
+    log0(f"ttt_sliding:done val_loss={val_loss:.6f} val_bpb={val_bpb:.6f} "
+         f"elapsed={time.perf_counter() - t0:.1f}s")
+    return val_loss, val_bpb
+
+
 # --- GPTQ-lite int6 quantization ---
 
 def _classify_param(name: str) -> str:
@@ -1090,82 +1241,6 @@ def _classify_param(name: str) -> str:
     return "other"
 def quantize_int6_per_row(t: Tensor, clip_range: int = 31) -> tuple[Tensor, Tensor]:
     t32 = t.float()
-    if t32.ndim == 2:
-        best_q, best_s, best_err = None, None, float('inf')
-        for pct in [0.9990, 0.9995, 0.9999, 0.99999, 1.0]:
-            if pct < 1.0:
-                row_clip = torch.quantile(t32.abs(), pct, dim=1)
-            else:
-                row_clip = t32.abs().amax(dim=1)
-            s = (row_clip / clip_range).clamp_min(1.0 / clip_range).to(torch.float16)
-            q = torch.clamp(torch.round(t32 / s.float()[:, None]), -clip_range, clip_range).to(torch.int8)
-            recon = q.float() * s.float()[:, None]
-            err = (t32 - recon).pow(2).mean().item()
-            if err < best_err:
-                best_q, best_s, best_err = q, s, err
-        return best_q, best_s
-    amax = t32.abs().max().item()
-    scale = torch.tensor(amax / clip_range if amax > 0 else 1.0, dtype=torch.float16)
-    q = torch.clamp(torch.round(t32 / scale.float()), -clip_range, clip_range).to(torch.int8)
-    return q, scale
-
-def quantize_int6_gptq(weight, hessian=None, clip_range=31, block_size=128):
-    """Full GPTQ: Hessian-aware int6 quantization with Cholesky error compensation.
-    If hessian is None, falls back to percentile search."""
-    t32 = weight.float()
-    if t32.ndim != 2 or hessian is None:
-        return _quantize_int6_percentile(t32, clip_range)
-    rows, cols = t32.shape
-    H = hessian.float().clone()
-    dead = torch.diag(H) == 0
-    H[dead, dead] = 1
-    damp = 0.01 * torch.mean(torch.diag(H))
-    H[torch.arange(cols), torch.arange(cols)] += damp
-    perm = torch.argsort(torch.diag(H), descending=True)
-    inv_perm = torch.argsort(perm)
-    W = t32[:, perm].clone()
-    W[:, dead[perm]] = 0
-    H = H[perm][:, perm]
-    Hinv = torch.linalg.cholesky(H)
-    Hinv = torch.cholesky_inverse(Hinv)
-    Hinv = torch.linalg.cholesky(Hinv, upper=True)
-    best_q = None; best_scale = None; best_err = float('inf')
-    for pct in [0.9990, 0.9995, 0.9999, 0.99999, 1.0]:
-        if pct < 1.0:
-            row_clip = torch.quantile(t32.abs(), pct, dim=1)
-        else:
-            row_clip = t32.abs().amax(dim=1)
-        s = (row_clip / clip_range).clamp_min(1.0 / clip_range).to(torch.float16)
-        sf = s.float()
-        Q = torch.zeros_like(W, dtype=torch.int8)
-        W_work = W.clone()
-        for i1 in range(0, cols, block_size):
-            i2 = min(i1 + block_size, cols)
-            count = i2 - i1
-            W1 = W_work[:, i1:i2].clone()
-            Q1 = torch.zeros(rows, count, dtype=torch.int8)
-            Err1 = torch.zeros(rows, count)
-            Hinv1 = Hinv[i1:i2, i1:i2]
-            for i in range(count):
-                w = W1[:, i]
-                d = Hinv1[i, i]
-                q = torch.clamp(torch.round(w / sf), -clip_range, clip_range).to(torch.int8)
-                Q1[:, i] = q
-                err = (w - q.float() * sf) / d
-                W1[:, i:] -= err.unsqueeze(1) * Hinv1[i, i:].unsqueeze(0)
-                Err1[:, i] = err
-            Q[:, i1:i2] = Q1
-            if i2 < cols:
-                W_work[:, i2:] -= Err1 @ Hinv[i1:i2, i2:]
-        recon = Q.float() * sf[:, None]
-        mse = (W - recon).pow(2).mean().item()
-        if mse < best_err:
-            best_q, best_scale, best_err = Q, s, mse
-    best_q = best_q[:, inv_perm]
-    return best_q, best_scale
-
-def _quantize_int6_percentile(t32, clip_range=31):
-    """Fallback: percentile search (for 1D or no-Hessian cases)."""
     if t32.ndim == 2:
         best_q, best_s, best_err = None, None, float('inf')
         for pct in [0.9990, 0.9995, 0.9999, 0.99999, 1.0]:
@@ -1252,186 +1327,7 @@ def _rebank_state_dict(sd: dict[str, Tensor], num_layers: int, template_sd: dict
             out[name] = tensor
     return out
 
-# --- Non-banked model for Hessian collection ---
-# This mirrors the unbanked state dict keys: blocks.{i}.attn.c_q/c_k/c_v/proj, blocks.{i}.mlp.fc/proj
-
-class _HessianAttn(nn.Module):
-    """Non-banked attention with CastedLinear layers for Hessian hooks."""
-    def __init__(self, dim, num_heads, num_kv_heads, rope_base, qk_gain_init):
-        super().__init__()
-        self.num_heads, self.num_kv_heads = num_heads, num_kv_heads
-        self.head_dim = dim // num_heads
-        kv_dim = num_kv_heads * self.head_dim
-        self.c_q = CastedLinear(dim, dim, bias=False)
-        self.c_k = CastedLinear(dim, kv_dim, bias=False)
-        self.c_v = CastedLinear(dim, kv_dim, bias=False)
-        self.proj = CastedLinear(dim, dim, bias=False)
-        self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
-        self.rope_dims = 0
-        self.rotary = Rotary(self.head_dim, base=rope_base, train_seq_len=1024)
-        self.use_xsa = False
-    def _xsa_efficient(self, y, v):
-        B, T, H, D = y.shape; Hkv = v.size(-2); group = H // Hkv
-        y_g = y.reshape(B, T, Hkv, group, D)
-        vn = F.normalize(v, dim=-1).unsqueeze(-2)
-        proj = (y_g * vn).sum(dim=-1, keepdim=True) * vn
-        return (y_g - proj).reshape(B, T, H, D)
-    def forward(self, x, v_embed=None):
-        bsz, seqlen, dim = x.shape
-        q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim)
-        k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
-        v = self.c_v(x)
-        if v_embed is not None:
-            v = v + v_embed
-        v = v.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
-        q = F.rms_norm(q, (q.size(-1),))
-        k = F.rms_norm(k, (k.size(-1),))
-        cos, sin = self.rotary(seqlen, x.device, q.dtype)
-        q = apply_rotary_emb(q, cos, sin, self.rope_dims)
-        k = apply_rotary_emb(k, cos, sin, self.rope_dims)
-        q = q * self.q_gain.to(dtype=q.dtype)[None, None, :, None]
-        y = flash_attn_3_func(q, k, v, causal=True)
-        if self.use_xsa:
-            y = self._xsa_efficient(y, v)
-        return self.proj(y.reshape(bsz, seqlen, dim))
-
-class _HessianMLP(nn.Module):
-    """Non-banked MLP with CastedLinear layers for Hessian hooks."""
-    def __init__(self, dim, mlp_mult):
-        super().__init__()
-        self.fc = CastedLinear(dim, int(mlp_mult * dim), bias=False)
-        self.proj = CastedLinear(int(mlp_mult * dim), dim, bias=False)
-    def forward(self, x):
-        return self.proj(F.leaky_relu(self.fc(x), negative_slope=0.5).square())
-
-class _HessianBlock(nn.Module):
-    def __init__(self, dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, layer_idx=0, ln_scale=False):
-        super().__init__()
-        self.attn_norm = RMSNorm()
-        self.mlp_norm = RMSNorm()
-        self.attn = _HessianAttn(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = _HessianMLP(dim, mlp_mult)
-        self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
-        self.ln_scale_factor = 1.0 / math.sqrt(layer_idx + 1) if ln_scale else 1.0
-    def forward(self, x, x0, v_embed=None):
-        mix = self.resid_mix.to(dtype=x.dtype)
-        x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x_in) * self.ln_scale_factor, v_embed=v_embed)
-        x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
-        x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * self.mlp(self.mlp_norm(x_out) * self.ln_scale_factor)
-        return x_out
-
-class _HessianGPT(nn.Module):
-    """Non-banked GPT model matching unbanked state dict keys for Hessian collection."""
-    def __init__(self, vocab_size, num_layers, model_dim, num_heads, num_kv_heads,
-                 mlp_mult, tie_embeddings, logit_softcap, rope_base, qk_gain_init,
-                 bigram_vocab_size=0, bigram_dim=128, xsa_last_n=0,
-                 rope_dims=0, ln_scale=False,
-                 ve_enabled=False, ve_dim=128, ve_layers="9,10"):
-        super().__init__()
-        self.tie_embeddings = tie_embeddings
-        self.logit_softcap = logit_softcap
-        self.num_layers = num_layers
-        self.tok_emb = nn.Embedding(vocab_size, model_dim)
-        self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim, trigram=bool(int(os.environ.get("TRIGRAM", "0")))) if bigram_vocab_size > 0 else None
-        self.smear = SmearGate(model_dim)
-        self.num_encoder_layers = num_layers // 2
-        self.num_decoder_layers = num_layers - self.num_encoder_layers
-        self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
-        self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
-        self.blocks = nn.ModuleList([
-            _HessianBlock(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
-                          layer_idx=i, ln_scale=ln_scale)
-            for i in range(num_layers)
-        ])
-        if rope_dims > 0:
-            head_dim = model_dim // num_heads
-            for block in self.blocks:
-                block.attn.rope_dims = rope_dims
-                block.attn.rotary = Rotary(head_dim, base=rope_base, train_seq_len=1024, rope_dims=rope_dims)
-        if xsa_last_n > 0:
-            for i in range(max(0, num_layers - xsa_last_n), num_layers):
-                self.blocks[i].attn.use_xsa = True
-        kv_dim = num_kv_heads * (model_dim // num_heads)
-        self.ve_layer_indices = [int(x) for x in ve_layers.split(",") if x.strip()] if ve_enabled else []
-        if self.ve_layer_indices:
-            self.ve_shared = ValueEmbedding(vocab_size, ve_dim, kv_dim)
-            self.ve_layer_scales = nn.ParameterList([nn.Parameter(torch.ones(1, dtype=torch.float32)) for _ in self.ve_layer_indices])
-        else:
-            self.ve_shared = None
-            self.ve_layer_scales = nn.ParameterList()
-        self.final_norm = RMSNorm()
-        self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
-    def _get_ve(self, layer_idx, input_ids, ve_cache):
-        if self.ve_shared is None or layer_idx not in self.ve_layer_indices:
-            return None
-        if 've' not in ve_cache:
-            ve_cache['ve'] = self.ve_shared(input_ids)
-        ve_idx = self.ve_layer_indices.index(layer_idx)
-        return ve_cache['ve'] * self.ve_layer_scales[ve_idx].to(dtype=ve_cache['ve'].dtype)
-    def forward(self, input_ids, target_ids):
-        x = self.tok_emb(input_ids)
-        if self.bigram is not None:
-            x = x + self.bigram(input_ids)
-        x = F.rms_norm(x, (x.size(-1),))
-        x = self.smear(x)
-        x0 = x
-        skips = []
-        ve_cache = {}
-        for i in range(self.num_encoder_layers):
-            ve = self._get_ve(i, input_ids, ve_cache)
-            x = self.blocks[i](x, x0, v_embed=ve)
-            skips.append(x)
-        for i in range(self.num_decoder_layers):
-            bi = self.num_encoder_layers + i
-            if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            ve = self._get_ve(bi, input_ids, ve_cache)
-            x = self.blocks[bi](x, x0, v_embed=ve)
-        x = self.final_norm(x)
-        x_flat = x.reshape(-1, x.size(-1))
-        targets = target_ids.reshape(-1)
-        logits_proj = F.linear(x_flat, self.tok_emb.weight) if self.tie_embeddings else self.lm_head(x_flat)
-        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        return F.cross_entropy(logits.float(), targets, reduction="mean")
-
-def collect_hessians(hessian_model, train_loader, args, device, grad_accum_steps, num_batches=256):
-    """Run calibration batches through a non-banked model, collecting H = X^T X for each CastedLinear."""
-    hessians = {}
-    hooks = []
-    for name, module in hessian_model.named_modules():
-        if isinstance(module, CastedLinear):
-            param_name = name + ".weight"
-            cols = module.weight.shape[1]
-            hessians[param_name] = torch.zeros(cols, cols, dtype=torch.float32, device='cpu')
-            def make_hook(pname):
-                def hook_fn(module, input, output):
-                    x = input[0].detach().float()
-                    if x.ndim == 3:
-                        x = x.reshape(-1, x.shape[-1])
-                    hessians[pname] += (x.T @ x).cpu()
-                return hook_fn
-            h = module.register_forward_hook(make_hook(param_name))
-            hooks.append(h)
-    hessian_model.eval()
-    with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-        for _ in range(num_batches):
-            x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-            hessian_model(x, y)
-    for h in hooks:
-        h.remove()
-    for name in hessians:
-        H = hessians[name]
-        H /= num_batches
-        damp = 0.01 * torch.diag(H).mean().clamp_min(1e-6)
-        H += damp * torch.eye(H.shape[0])
-        hessians[name] = H
-    hessian_model.train()
-    return hessians
-
-def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str], hessians: dict[str, Tensor] | None = None):
+def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str]):
     num_layers_total = max(
         (int(k.split(".")[1]) for k in state_dict if k.startswith("blocks.")),
         default=0,
@@ -1451,12 +1347,7 @@ def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str], hess
             meta[name] = "passthrough_ctrl"
             continue
         if cat in int6_cats and t.ndim >= 1:
-            cr = 31  # int6 for all weights
-            H = hessians.get(name) if hessians else None
-            if H is not None:
-                q, s = quantize_int6_gptq(t, hessian=H, clip_range=cr)
-            else:
-                q, s = quantize_int6_per_row(t, clip_range=cr)
+            q, s = quantize_int6_per_row(t)
             result[name + ".q"] = q
             result[name + ".scale"] = s
             meta[name] = {"type": "int6"}
@@ -1897,81 +1788,7 @@ def main() -> None:
     # Unbank 3D tensors into individual 2D tensors for quantization
     sd_cpu = {k: v.detach().cpu() for k, v in export_sd.items()}
     unbanked_sd = _unbank_state_dict(sd_cpu, args.num_layers)
-    # Full GPTQ: collect Hessians via a temporary non-banked model
-    log0(f"gptq:building non-banked model for Hessian collection...")
-    hessian_model = _HessianGPT(
-        vocab_size=args.vocab_size, num_layers=args.num_layers, model_dim=args.model_dim,
-        num_heads=args.num_heads, num_kv_heads=args.num_kv_heads, mlp_mult=args.mlp_mult,
-        tie_embeddings=args.tie_embeddings, logit_softcap=args.logit_softcap,
-        rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
-        bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
-        xsa_last_n=args.xsa_last_n, rope_dims=args.rope_dims, ln_scale=args.ln_scale,
-        ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
-    ).to(device).bfloat16()
-    for m in hessian_model.modules():
-        if isinstance(m, CastedLinear):
-            m.float()
-    restore_low_dim_params_to_fp32(hessian_model)
-    # Load unbanked weights into the non-banked model
-    hessian_model.load_state_dict(
-        {k: v.to(device) for k, v in unbanked_sd.items() if k in hessian_model.state_dict()},
-        strict=False,
-    )
-    log0(f"gptq:calibrating with {args.gptq_calib_batches} batches...")
-    calib_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-    hessians = collect_hessians(hessian_model, calib_loader, args, device, grad_accum_steps,
-                                num_batches=args.gptq_calib_batches)
-    log0(f"gptq:collected hessians for {len(hessians)} layers")
-    del hessian_model
-    torch.cuda.empty_cache()
-    quant_result, quant_meta = mixed_quantize_int6(unbanked_sd, {"mlp", "attn"}, hessians=hessians)
-    # NOVEL: Selective ±1 pruning by reconstruction error
-    # Sort ±1 quantized values by their reconstruction error (scale²),
-    # prune least-impactful first until artifact fits target size.
-    target_mb = float(os.environ.get("TARGET_MB", "15.9"))
-    code_bytes_est = len(code.encode("utf-8"))
-    ones_info = []  # (tensor_key, flat_idx, error)
-    for name, info in quant_meta.items():
-        if not (isinstance(info, dict) and info.get("type") == "int6"): continue
-        qk, sk = name + ".q", name + ".scale"
-        if qk not in quant_result or sk not in quant_result: continue
-        q, s = quant_result[qk], quant_result[sk]
-        if s.ndim > 0:
-            ones_mask = (q.abs() == 1)
-            if ones_mask.any():
-                row_idx = torch.arange(q.shape[0]).unsqueeze(1).expand_as(q)[ones_mask]
-                flat_idx = torch.arange(q.numel()).reshape(q.shape)[ones_mask]
-                errors = s.float()[row_idx].pow(2)
-                for fi, err in zip(flat_idx.tolist(), errors.tolist()):
-                    ones_info.append((qk, fi, err))
-    if ones_info:
-        ones_info.sort(key=lambda x: x[2])
-        def _try_prune(n):
-            tmp = {k: v.clone() for k, v in quant_result.items()}
-            for i in range(min(n, len(ones_info))):
-                tmp[ones_info[i][0]].view(-1)[ones_info[i][1]] = 0
-            buf = io.BytesIO(); torch.save({"w": tmp, "m": quant_meta}, buf)
-            return len(lzma.compress(buf.getvalue(), preset=6)) + code_bytes_est, tmp
-        no_sz, _ = _try_prune(0)
-        target_bytes = int(target_mb * 1024 * 1024)
-        log0(f"selective_prune: {len(ones_info)} ±1 candidates, unpruned={no_sz/(1024*1024):.2f}MB target={target_mb}MB")
-        if no_sz <= target_bytes:
-            log0("selective_prune: already fits, no pruning needed")
-        else:
-            full_sz, _ = _try_prune(len(ones_info))
-            log0(f"selective_prune: full ±1 prune={full_sz/(1024*1024):.2f}MB")
-            if full_sz > target_bytes:
-                log0("selective_prune: even full prune not enough, applying all")
-                _, quant_result = _try_prune(len(ones_info))
-            else:
-                lo, hi = 0, len(ones_info)
-                while lo < hi:
-                    mid = (lo + hi) // 2
-                    sz, _ = _try_prune(mid)
-                    if sz <= target_bytes: hi = mid
-                    else: lo = mid + 1
-                log0(f"selective_prune: pruning {lo}/{len(ones_info)} ±1 values ({100*lo/len(ones_info):.1f}%) to fit {target_mb}MB")
-                _, quant_result = _try_prune(lo)
+    quant_result, quant_meta = mixed_quantize_int6(unbanked_sd, {"mlp", "attn"})
     quant_buf = io.BytesIO()
     torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
     quant_raw = quant_buf.getvalue()
@@ -2062,6 +1879,19 @@ def main() -> None:
         )
         log0(f"final_int6_sliding_window_s64_exact val_loss:{sw64_val_loss:.8f} val_bpb:{sw64_val_bpb:.8f}")
         log0(f"final_int8_zlib_roundtrip_exact val_loss:{sw64_val_loss:.8f} val_bpb:{sw64_val_bpb:.8f}")
+    # Legal score-first TTT (PR #461 recipe)
+    if args.ttt_enabled:
+        torch.cuda.synchronize()
+        t_ttt = time.perf_counter()
+        ttt_loss, ttt_bpb = eval_val_sliding_ttt(
+            args, eval_model, rank, world_size, device,
+            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+            stride=args.eval_stride, log0=log0,
+        )
+        torch.cuda.synchronize()
+        log0(f"legal_ttt val_loss:{ttt_loss:.4f} val_bpb:{ttt_bpb:.4f} "
+             f"eval_time:{1000.0 * (time.perf_counter() - t_ttt):.0f}ms")
+        log0(f"legal_ttt_exact val_loss:{ttt_loss:.8f} val_bpb:{ttt_bpb:.8f}")
     if distributed:
         dist.destroy_process_group()
 if __name__ == "__main__":
