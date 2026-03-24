@@ -24,6 +24,22 @@ The challenge: train the best language model that fits in **16MB** (code + int8+
 - **Training cap**: 10-minute wallclock limit (enforced by `MAX_WALLCLOCK_SECONDS=600` in the script)
 - **Baseline**: ~1.2244 val_bpb
 
+## ILLEGAL TECHNIQUES — DO NOT IMPLEMENT
+
+**Pre-eval TTT (test-time training) is ILLEGAL.** Per OpenAI ruling (issue #402):
+- You CANNOT train/fine-tune on validation tokens BEFORE scoring them
+- You CANNOT adapt model weights using validation data before evaluation
+- Any BPB below ~0.95 is proven to be memorization, not learning
+- Entries using pre-eval TTT have been marked invalid (❌) on the leaderboard
+
+**Legal TTT (score-first, backward-looking) IS allowed** but complex:
+- Score a chunk of tokens FIRST, locking in those grades
+- THEN adapt on those already-scored tokens
+- The adapted model scores the NEXT chunk better
+- Every token must be scored BEFORE any gradient update uses it
+
+**When in doubt, do NOT implement TTT.** Focus on training improvements, architecture changes, quantization, and optimizer tuning instead — these are safer and more impactful.
+
 ## Experimentation
 
 **What you CAN modify:**
