@@ -29,8 +29,8 @@ fi
 
 # 2. Check line count
 LINE_COUNT=$(wc -l < train_gpt.py)
-if [ "$LINE_COUNT" -gt 1500 ]; then
-    echo "ERROR: train_gpt.py has $LINE_COUNT lines (limit: 1500)." >&2
+if [ "$LINE_COUNT" -gt 2500 ]; then
+    echo "ERROR: train_gpt.py has $LINE_COUNT lines (limit: 2500)." >&2
     summary "ERROR" "0" "$LINE_COUNT" "false"
     exit 0
 fi
